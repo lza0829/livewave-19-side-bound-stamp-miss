@@ -70,6 +70,51 @@ def 跑贯验() -> dict:
         if 绑定缺事件:
             问题.append(f"旁路行绑定了不存在的事件:{绑定缺事件}")
 
+        # 旁路界戳协同：禁止旁路成功戳空、禁止同事件既在匣又改累计、禁止戳号顶替。
+        空戳 = conn.execute(
+            """SELECT COUNT(*) FROM 旁路匣 b
+               WHERE b.升格状态 IN ('待升格','已升格') AND b.事件编号<>''
+                 AND NOT EXISTS (SELECT 1 FROM 旁路界戳 s WHERE s.事件编号=b.事件编号)"""
+        ).fetchone()[0]
+        if 空戳:
+            问题.append(f"旁路成功戳空:{空戳}")
+
+        戳双记 = conn.execute(
+            """SELECT COUNT(*) FROM 旁路界戳 s JOIN 互动事件 e ON e.事件编号=s.事件编号
+               WHERE s.戳态 IN ('旁路','待解旁路') AND e.命运='已入窗'"""
+        ).fetchone()[0]
+        if 戳双记:
+            问题.append(f"同事件既在匣又改累计:{戳双记}")
+
+        顶替 = conn.execute(
+            """SELECT COUNT(*) FROM (
+                 SELECT 戳号 FROM 旁路界戳
+                 GROUP BY 戳号 HAVING COUNT(*) > 1 OR COUNT(DISTINCT 事件编号) > 1
+               )""").fetchone()[0]
+        顶替 += conn.execute(
+            "SELECT COUNT(*) FROM 旁路界戳 WHERE 戳号=''"
+        ).fetchone()[0]
+        if 顶替:
+            问题.append(f"戳号重复或为空（疑似顶替）:{顶替}")
+
+        待办失配 = conn.execute(
+            """SELECT COUNT(*) FROM 旁路待办 d
+               WHERE (d.状态='待解' AND NOT EXISTS (
+                        SELECT 1 FROM 旁路界戳 s
+                        WHERE s.事件编号=d.事件编号 AND s.戳态='待解旁路'))
+                  OR (d.状态='已解' AND NOT EXISTS (
+                        SELECT 1 FROM 旁路界戳 s
+                        WHERE s.事件编号=d.事件编号 AND s.戳态='已解'))"""
+        ).fetchone()[0]
+        待办失配 += conn.execute(
+            """SELECT COUNT(*) FROM 旁路界戳 s
+               WHERE s.戳态='待解旁路' AND NOT EXISTS (
+                 SELECT 1 FROM 旁路待办 d
+                 WHERE d.事件编号=s.事件编号 AND d.状态='待解')"""
+        ).fetchone()[0]
+        if 待办失配:
+            问题.append(f"待办与戳态不一致:{待办失配}")
+
         通过 = 1 if not 问题 else 0
         说明 = "窗输出与事件/撤回/旁路互证通过" if 通过 else "；".join(问题)[:800]
         conn.execute(

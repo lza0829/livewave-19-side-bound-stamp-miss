@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from app.services import 时间
 
+状态 = "已实现"
 架构 = "乙-戳态机升级"
 架构甲 = "甲-界戳一票否决"
 允许的戳态 = ("旁路", "待解旁路", "已解")
@@ -32,6 +33,18 @@ class 界戳违规(Exception):
 
 
 def 当前架构() -> str:
+    """全局架构只有一个来源：超迟到旁路.架构（生产恒为乙，只在测试内翻转）。
+
+    本模块的 架构 常量仅作默认值；只要全局开关翻到甲，这里就一致返回甲，
+    迟到写闸与戳态机不会各说各话。延迟导入避免循环依赖。
+    """
+    try:
+        from app.services import 超迟到旁路
+
+        if 超迟到旁路.架构 == 超迟到旁路.架构甲:
+            return 架构甲
+    except Exception:
+        pass
     return 架构
 
 
@@ -160,7 +173,7 @@ def 消化迟到写(conn, 事件编号: str, 处理时: str) -> dict:
     if 戳["戳态"] not in ("旁路", "待解旁路"):
         raise 界戳违规(f"未知戳态:{戳['戳态']}")
 
-    if 架构 == 架构甲:
+    if 当前架构() == 架构甲:
         raise 界戳违规(
             "甲-界戳一票否决：该事件已有旁路界戳，迟到写整票拒绝，戳态与累计不变"
         )
@@ -189,7 +202,7 @@ def 消化迟到写(conn, 事件编号: str, 处理时: str) -> dict:
 
 def 应拒绝已旁路迟到(conn, 事件编号: str) -> bool:
     """迟到写闸用：当前架构下，有戳是否意味着必须拒绝。"""
-    return 架构 == 架构甲 and 有戳(conn, 事件编号)
+    return 当前架构() == 架构甲 and 有戳(conn, 事件编号)
 
 
 def 待办列表(conn, 事件编号: str | None = None) -> list[dict]:
@@ -248,12 +261,22 @@ def 核证(conn, 事件编号: str | None = None) -> dict:
              HAVING COUNT(*) > 1 OR COUNT(DISTINCT 事件编号) > 1
            )"""
     ).fetchone()[0]
-    空戳号 = conn.execute(
-        "SELECT COUNT(*) FROM 旁路界戳 WHERE 戳号=''"
+    # 戳号必须内嵌自身事件编号：邻事件占号或改号都算顶替。
+    顶替 += conn.execute(
+        """SELECT COUNT(*) FROM 旁路界戳
+           WHERE 戳号='' OR 戳号 NOT LIKE '戳:' || 事件编号 || ':%'"""
     ).fetchone()[0]
-    空戳号 += conn.execute(
-        "SELECT COUNT(*) FROM 旁路待办 WHERE 工单号=''"
+    工单顶替 = conn.execute(
+        """SELECT COUNT(*) FROM (
+             SELECT 工单号 FROM 旁路待办 GROUP BY 工单号
+             HAVING COUNT(*) > 1 OR COUNT(DISTINCT 事件编号) > 1
+           )"""
     ).fetchone()[0]
+    工单顶替 += conn.execute(
+        """SELECT COUNT(*) FROM 旁路待办
+           WHERE 工单号='' OR 工单号 NOT LIKE '工单:' || 事件编号 || ':%'"""
+    ).fetchone()[0]
+    顶替 += 工单顶替
 
     非法态 = conn.execute(
         "SELECT COUNT(*) FROM 旁路界戳 WHERE 戳态 NOT IN ('旁路','待解旁路','已解')"
@@ -284,18 +307,16 @@ def 核证(conn, 事件编号: str | None = None) -> dict:
     if 戳双记:
         问题.append(f"戳态未解事件已改正式累计:{戳双记}")
     if 顶替:
-        问题.append(f"戳号被重复/顶替:{顶替}")
-    if 空戳号:
-        问题.append(f"戳号/工单号为空:{空戳号}")
+        问题.append(f"戳号/工单号被重复、为空或被邻事件顶替:{顶替}")
     if 非法态:
         问题.append(f"非法戳态:{非法态}")
     if 待办失配:
         问题.append(f"待办与戳态不一致:{待办失配}")
 
-    戳态推进 = 架构 != 架构甲
-    禁迟到写 = 架构 == 架构甲
+    戳态推进 = 当前架构() != 架构甲
+    禁迟到写 = 当前架构() == 架构甲
     return {
-        "架构": 架构,
+        "架构": 当前架构(),
         "禁迟到写": 禁迟到写,
         "可再裁": True,
         "戳态推进": 戳态推进,
@@ -309,6 +330,20 @@ def 核证(conn, 事件编号: str | None = None) -> dict:
             if 禁迟到写
             else "持解旁路工单可解；解后仅乙改正式累计"
         ),
+        "对照口径": {
+            架构甲: {
+                "迟到写遇戳": "整票拒绝；戳态保持「旁路」，不落待办，累计不变",
+                "戳态是否推进": False,
+                "是否落待办": False,
+                "解旁路": "甲无待办可解；正式累计永不被该事件改动",
+            },
+            架构: {
+                "迟到写遇戳": "不改正式累计；戳态推进为「待解旁路」并落待办",
+                "戳态是否推进": True,
+                "是否落待办": True,
+                "解旁路": "持解旁路工单可解；解后仅乙改正式累计",
+            },
+        },
         "界戳": 戳行,
         "待办": 待办行,
         "核证": {
@@ -333,6 +368,7 @@ def 查界戳(conn, 事件编号: str | None = None) -> dict:
         "戳态推进": 果["戳态推进"],
         "可再裁": 果["可再裁"],
         "核证": 果["核证"],
+        "对照口径": 果["对照口径"],
         "口径": {
             "迟到写遇戳": 果["迟到写遇戳"],
             "解旁路": 果["解旁路"],

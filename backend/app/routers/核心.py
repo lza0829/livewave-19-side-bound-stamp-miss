@@ -18,6 +18,8 @@ def _写闸(函数):
         return 函数()
     except 装载.入流闸失败 as e:
         raise HTTPException(409, {"原因": str(e), "已回滚": True})
+    except 界.界戳违规 as e:
+        raise HTTPException(e.状态码, {"原因": e.原因, "已回滚": True})
     except sqlite3.OperationalError as e:
         if "locked" in str(e).lower() or "busy" in str(e).lower():
             raise HTTPException(409, {"原因": "并发写冲突，事务未提交（失败闭）", "已回滚": True})

@@ -21,6 +21,14 @@ export default function 旁路匣页() {
     }
     刷();
   };
+  const 解旁路 = async (事件编号, 工单号) => {
+    try {
+      设报(await 递("/旁路匣/解旁路", { 事件编号, 工单号 }));
+    } catch (e) {
+      设报({ 失败: String(e.message || e) });
+    }
+    刷();
+  };
 
   return (
     <div>
@@ -33,7 +41,8 @@ export default function 旁路匣页() {
         <div className="提示条">
           架构 {口.架构}：旁路是否改窗 = <b>{口.旁路是否改窗 ? "是" : "否"}</b>；升格接口是否可调用 ={" "}
           <b>{口.升格是否可调用 ? "是" : "否"}</b>；升格成功后是否改历史窗 ={" "}
-          <b>{口.升格后是否改历史窗 ? "是" : "否"}</b>。对照「甲 · 永久隔离」：升格接口必须拒绝、历史窗永不被该事件改动。
+          <b>{口.升格后是否改历史窗 ? "是" : "否"}</b>。界戳架构 {口.界戳架构}：迟到写遇戳 = <b>{口["迟到写遇戳"]}</b>；
+          解旁路 = <b>{口["解旁路"]}</b>。
         </div>
       )}
       <div className="行"><button className="次" onClick={刷}>刷新旁路</button></div>
@@ -44,7 +53,8 @@ export default function 旁路匣页() {
           <thead>
             <tr>
               <th>编号</th><th>事件编号</th><th>原因</th><th>水位</th><th>窗止</th><th>旁路界</th>
-              <th>升格状态</th><th>升格可调用</th><th>是否改窗</th><th>valid</th><th></th>
+              <th>升格状态</th><th>戳态</th><th>待办</th><th>升格可调用</th><th>解旁路可调用</th>
+              <th>是否改窗</th><th>valid</th><th></th>
             </tr>
           </thead>
           <tbody>
@@ -57,7 +67,10 @@ export default function 旁路匣页() {
                 <td className="码">{r.窗止 || "—"}</td>
                 <td className="码">{r.旁路界 || "—"}</td>
                 <td>{r.升格状态}</td>
+                <td>{r.戳态 || "—"}</td>
+                <td>{r.待办状态 || "—"}</td>
                 <td>{r.升格是否可调用 ? "可" : "否"}</td>
+                <td>{r.解旁路是否可调用 ? "可" : "否"}</td>
                 <td>{r.是否改窗 ? "是" : "否"}</td>
                 <td>
                   <span className={`徽章 ${r.valid ? "通" : "败"}`}>{r.valid ? "有效" : "无效"}</span>
@@ -69,6 +82,11 @@ export default function 旁路匣页() {
                   {r.升格是否可调用 && (
                     <button className="水" style={{ padding: "0.2rem 0.55rem", marginLeft: "0.35rem" }} onClick={() => 升格(r.事件编号)}>
                       升格
+                    </button>
+                  )}
+                  {r.解旁路是否可调用 && (
+                    <button className="水" style={{ padding: "0.2rem 0.55rem", marginLeft: "0.35rem" }} onClick={() => 解旁路(r.事件编号, r.工单号)}>
+                      解旁路
                     </button>
                   )}
                 </td>
@@ -97,7 +115,12 @@ export default function 旁路匣页() {
                 ["窗止", 详情.窗止],
                 ["旁路界", 详情.旁路界],
                 ["升格状态", 详情.升格状态],
+                ["戳号", 详情.戳号],
+                ["戳态", 详情.戳态],
+                ["待办状态", 详情.待办状态],
+                ["工单号", 详情.工单号],
                 ["升格是否可调用", 详情.升格是否可调用 ? "是" : "否"],
+                ["解旁路是否可调用", 详情.解旁路是否可调用 ? "是" : "否"],
                 ["是否改窗", 详情.是否改窗 ? "是" : "否"],
                 ["升格是否改历史窗", 详情.升格是否改历史窗 ? "是" : "否"],
                 ["valid", 详情.valid ? "是" : "否"],
