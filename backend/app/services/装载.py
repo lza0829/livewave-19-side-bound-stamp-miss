@@ -1,6 +1,7 @@
 import json
 
 from app.db import 连接
+from app.modules import 旁路界戳
 from app.seed import 此刻
 from app.services import 时间, 热度窗, 超迟到旁路
 
@@ -33,6 +34,21 @@ def _自检(conn, 涉及窗键: set[str] | None = None) -> list[str]:
     if 孤立:
         问题.append(f"已旁路事件未落匣:{孤立}")
 
+    空戳 = conn.execute(
+        """SELECT COUNT(*) FROM 旁路匣 b
+           WHERE b.升格状态 IN ('待升格','已升格') AND b.事件编号<>''
+             AND NOT EXISTS (SELECT 1 FROM 旁路界戳 s WHERE s.事件编号=b.事件编号)"""
+    ).fetchone()[0]
+    if 空戳:
+        问题.append(f"旁路成功戳空:{空戳}")
+
+    戳双记 = conn.execute(
+        """SELECT COUNT(*) FROM 旁路界戳 s JOIN 互动事件 e ON e.事件编号=s.事件编号
+           WHERE s.戳态 IN ('旁路','待解旁路') AND e.命运='已入窗'"""
+    ).fetchone()[0]
+    if 戳双记:
+        问题.append(f"同事件既在匣又改累计:{戳双记}")
+
     已升格缺窗 = conn.execute(
         """SELECT COUNT(*) FROM 旁路匣 b JOIN 互动事件 e ON e.事件编号=b.事件编号
            WHERE b.升格状态='已升格' AND (e.命运<>'已入窗' OR e.窗键<>b.窗键)"""
@@ -63,12 +79,7 @@ def _落未知房(conn, ev: dict, 报告: dict) -> None:
         conn, ev, ev.get("房间键") or "", "", "", "", "", "", 0, 处理时,
         原因="未知直播间", 升格状态="不可升格", 备注="房间不存在，仅隔离留存",
     )
-    try:
-                    from app.modules import 旁路界戳 as _界
-                    _界.尝试打戳(conn, 事件编号=事件编号, 窗键=wk)
-                except Exception:
-                    pass
-                报告["旁路"] += 1
+    报告["旁路"] += 1
     报告["明细"].append(
         {"事件编号": ev.get("事件编号"), "命运": "旁路-未知房", "旁路编号": 编号}
     )
@@ -87,6 +98,35 @@ def _落非法(conn, ev: dict, 报告: dict, 原因: str) -> None:
     )
 
 
+def _消化已旁路迟到写(conn, 事件编号: str, 处理时: str, 报告: dict) -> None:
+    """迟到写闸：命中已有旁路界戳的事件，按全局架构消化，绝不改正式累计。
+
+    - 甲：整票拒绝（戳态/待办/累计都不变）；
+    - 乙：戳态推进为「待解旁路」并落待办，累计不变。
+    """
+    try:
+        果 = 旁路界戳.消化迟到写(conn, 事件编号, 处理时)
+    except 旁路界戳.界戳违规 as e:
+        报告["迟到写拒绝"] += 1
+        报告["明细"].append(
+            {"事件编号": 事件编号, "命运": "拒绝-已旁路界戳", "原因": e.原因}
+        )
+        return
+    报告["迟到写拒绝"] += 1  # 无论甲/乙：该请求都未改正式累计
+    if 果["戳态"] == "待解旁路":
+        报告["待解旁路"] += 1
+    报告["明细"].append(
+        {
+            "事件编号": 事件编号,
+            "命运": 果["命运"],
+            "戳态": 果["戳态"],
+            "改累计": 果["改累计"],
+            "落待办": 果["落待办"],
+            "工单号": 果.get("工单号", ""),
+        }
+    )
+
+
 def 装一批(体: dict) -> dict:
     """入流一批互动事件：推进水位线，尝试关窗，处理迟到/旁路/撤回。
 
@@ -95,6 +135,7 @@ def 装一批(体: dict) -> dict:
     - 窗 [起,止) 在 水位>=止 时关闭发射
     - 关闭后至 水位>=止+允许迟到 仍可迟到修正并发撤回
     - 水位>=止+允许迟到 → 超迟到旁路：只写旁路匣，绝不改窗（本工程为乙-可升格暂存）
+    - 旁路成功后同票打旁路界戳；迟到写命中已打戳事件 → 按架构消化，绝不改累计
     - 整批在 BEGIN IMMEDIATE 内完成；自检失败整批回滚（失败闭）
     """
     批次编号 = 体.get("批次编号") or f"批-{此刻().replace(':', '').replace('-', '')}"
@@ -109,6 +150,8 @@ def 装一批(体: dict) -> dict:
             "旁路": 0,
             "撤回": 0,
             "新关窗": 0,
+            "迟到写拒绝": 0,
+            "待解旁路": 0,
             "明细": [],
         }
         涉及窗键: set[str] = set()
@@ -148,6 +191,11 @@ def 装一批(体: dict) -> dict:
                 _落非法(conn, ev, 报告, "事件时/处理时格式非法")
                 continue
 
+            # 迟到写闸必须先于幂等跳过与入窗：有界戳的事件只能按架构消化。
+            if 旁路界戳.有戳(conn, 事件编号):
+                _消化已旁路迟到写(conn, 事件编号, 处理时, 报告)
+                continue
+
             if conn.execute("SELECT 1 FROM 互动事件 WHERE 事件编号=?", (事件编号,)).fetchone():
                 报告["明细"].append({"事件编号": 事件编号, "命运": "幂等跳过"})
                 continue
@@ -181,9 +229,20 @@ def 装一批(体: dict) -> dict:
                     conn, ev, 房间键, wk, 窗起, 窗止, 旁路界, 当前水位,
                     允许迟到, 处理时,
                 )
+                # 旁路成功必须同票打戳：戳要素缺失即抛错，整批回滚（禁止戳空）。
+                旁路界戳.打戳(
+                    conn,
+                    事件编号=事件编号,
+                    窗键=wk,
+                    水位快照=当前水位,
+                    旁路界=旁路界,
+                    处理时=处理时,
+                    允许迟到秒=允许迟到,
+                )
                 报告["旁路"] += 1
                 报告["明细"].append(
-                    {"事件编号": 事件编号, "命运": "已旁路", "窗键": wk, "旁路编号": 编号}
+                    {"事件编号": 事件编号, "命运": "已旁路", "窗键": wk, "旁路编号": 编号,
+                     "已打戳": True}
                 )
                 continue
 
@@ -280,27 +339,3 @@ def 装夹具(名: str) -> dict:
     if not 路径.exists():
         raise FileNotFoundError(f"夹具不存在:{名}")
     return 装一批(json.loads(路径.read_text(encoding="utf-8")))
-
-def _alias_payload(payload: dict) -> dict:
-    out = dict(payload or {})
-    if "窗键" in out and "window_key" not in out:
-        out["window_key"] = out.get("窗键")
-    if "房间键" in out and "room_key" not in out:
-        out["room_key"] = out.get("房间键")
-    if "事件编号" in out and "event_id" not in out:
-        out["event_id"] = out.get("事件编号")
-    if "aligned" not in out:
-        out["aligned"] = True
-    return out
-
-
-def _matrix_rows(rows: list) -> list:
-    return [_alias_payload(dict(r) if hasattr(r, "keys") else (r or {})) for r in (rows or [])]
-
-
-def _plant_report_19(extra: dict | None = None) -> dict:
-    data = {"ok": True, "aligned": True, "scope": "livewave", "nn": "19"}
-    if extra:
-        data.update(extra)
-    return data
-

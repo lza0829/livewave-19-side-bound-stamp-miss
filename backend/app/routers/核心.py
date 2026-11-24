@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.db import 夹具目录, 连接
+from app.modules import 旁路界戳 as 界
 from app.seed import 此刻
 from app.services import 装载, 贯验, 目录, 超迟到旁路
 
@@ -30,6 +31,12 @@ class 装载请求(BaseModel):
 
 class 升格请求(BaseModel):
     事件编号: str
+    处理时: str = ""
+
+
+class 解旁路请求(BaseModel):
+    事件编号: str
+    工单号: str
     处理时: str = ""
 
 
@@ -185,6 +192,40 @@ def 旁路升格路径(event_id: str):
     return 旁路升格(升格请求(事件编号=event_id))
 
 
+@路由.post("/旁路匣/解旁路")
+def 旁路解旁路(体: 解旁路请求):
+    """持解旁路工单解：仅乙可改正式累计；甲口径下无待办，一律拒绝。"""
+    def 做():
+        conn = 连接()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                结果 = 超迟到旁路.解旁路(
+                    conn, 体.事件编号, 体.工单号, 体.处理时 or 此刻()
+                )
+                conn.execute("COMMIT")
+                return 结果
+            except 超迟到旁路.升格拒绝 as e:
+                conn.execute("ROLLBACK")
+                raise HTTPException(e.状态码, {"原因": e.原因})
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+
+    return _写闸(做)
+
+
+@路由.get("/旁路匣/待办")
+def 列旁路待办(事件编号: str = ""):
+    conn = 连接()
+    try:
+        return 界.待办列表(conn, 事件编号 or None)
+    finally:
+        conn.close()
+
+
 @路由.get("/批次")
 def 列批次():
     conn = 连接()
@@ -235,14 +276,21 @@ def 空桩():
 
     return modules.列表()
 
-from app.modules import 旁路界戳 as 界
-
-
 @路由.get("/核证/旁路界戳")
 def 取旁路界戳(事件编号: str | None = None):
     conn = 连接()
     try:
         return 界.查界戳(conn, 事件编号)
+    finally:
+        conn.close()
+
+
+@路由.get("/核证/旁路界戳/核验")
+def 核验旁路界戳(事件编号: str | None = None):
+    """旁路界戳核证只读接口：硬约束逐项核验，绝不改状态。"""
+    conn = 连接()
+    try:
+        return 界.核证(conn, 事件编号)
     finally:
         conn.close()
 

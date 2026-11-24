@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from datetime import datetime, timezone
 
 from app.db import 连接
@@ -11,7 +12,21 @@ CREATE TABLE IF NOT EXISTS 旁路界戳 (
   水位快照 TEXT NOT NULL DEFAULT '',
   旁路界 TEXT NOT NULL DEFAULT '',
   戳号 TEXT NOT NULL DEFAULT '',
-  时刻 TEXT NOT NULL DEFAULT ''
+  时刻 TEXT NOT NULL DEFAULT '',
+  戳态 TEXT NOT NULL DEFAULT '旁路'
+);
+
+CREATE TABLE IF NOT EXISTS 旁路待办 (
+  编号 INTEGER PRIMARY KEY AUTOINCREMENT,
+  事件编号 TEXT NOT NULL,
+  戳号 TEXT NOT NULL DEFAULT '',
+  窗键 TEXT NOT NULL DEFAULT '',
+  状态 TEXT NOT NULL DEFAULT '待解',
+  原因 TEXT NOT NULL DEFAULT '',
+  创建处理时 TEXT NOT NULL DEFAULT '',
+  解处理时 TEXT NOT NULL DEFAULT '',
+  工单号 TEXT NOT NULL DEFAULT '',
+  备注 TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS 站规 (
@@ -103,7 +118,47 @@ CREATE TABLE IF NOT EXISTS 窗贯验 (
   是否通过 INTEGER NOT NULL,
   说明 TEXT NOT NULL
 );
-把旧版只有「载荷」的旁路行补成可查询/可升格的结构化行。
+"""
+
+默认站规 = {
+    "窗长秒": "60",
+    "允许迟到秒": "30",
+}
+
+
+def 此刻() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _补齐列(conn) -> None:
+    """给旧库补新列；旁路界戳的 戳态 是戳态机接管迟到写的必需列。"""
+    需要 = {
+        "旁路界戳": {"戳态": "TEXT NOT NULL DEFAULT '旁路'"},
+        "旁路待办": {"工单号": "TEXT NOT NULL DEFAULT ''"},
+    }
+    for 表, 列们 in 需要.items():
+        已有 = {r["name"] for r in conn.execute(f"PRAGMA table_info({表})")}
+        for 列, 定义 in 列们.items():
+            if 列 not in 已有:
+                conn.execute(f"ALTER TABLE {表} ADD COLUMN {列} {定义}")
+
+
+def _建索引(conn) -> None:
+    """唯一戳号/唯一事件编号；旧库若已有重复数据则跳过，代码层仍会拒绝顶替。"""
+    for sql in (
+        "CREATE UNIQUE INDEX IF NOT EXISTS 旁路界戳_事件唯一 ON 旁路界戳(事件编号)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS 旁路界戳_戳号唯一 ON 旁路界戳(戳号)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS 旁路待办_事件唯一 ON 旁路待办(事件编号)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS 旁路待办_工单唯一 ON 旁路待办(工单号)",
+    ):
+        try:
+            conn.execute(sql)
+        except sqlite3.IntegrityError:
+            pass
+
+
+def _回填历史旁路(conn) -> int:
+    """把旧版只有「载荷」的旁路行补成可查询/可升格的结构化行。
 
     旧载荷形如 {"事件编号","事件时","窗止","旁路界","水位"}，没有窗键。
     从互动事件行反推原窗键；推不出就标记不可升格，绝不静默改窗。
@@ -166,6 +221,43 @@ CREATE TABLE IF NOT EXISTS 窗贯验 (
     return 处理数
 
 
+def _补戳历史旁路(conn) -> int:
+    """历史待升格行若缺界戳则补戳；补不出就降为不可升格，绝不让空戳行可升格。"""
+    from app.modules import 旁路界戳
+
+    rows = conn.execute(
+        """SELECT b.* FROM 旁路匣 b
+           WHERE b.升格状态='待升格' AND b.事件编号<>''
+             AND NOT EXISTS (SELECT 1 FROM 旁路界戳 s WHERE s.事件编号=b.事件编号)"""
+    ).fetchall()
+    补数 = 0
+    for 行 in rows:
+        if not (行["窗键"] and 行["水位"] and 行["旁路界"]):
+            conn.execute(
+                "UPDATE 旁路匣 SET 升格状态='不可升格', 备注=? WHERE 编号=?",
+                ("历史旁路缺界戳要素，禁止升格", 行["编号"]),
+            )
+            continue
+        try:
+            旁路界戳.打戳(
+                conn,
+                事件编号=行["事件编号"],
+                窗键=行["窗键"],
+                水位快照=行["水位"],
+                旁路界=行["旁路界"],
+                处理时=行["时刻"] or 此刻(),
+                允许迟到秒=行["允许迟到秒"],
+            )
+        except 旁路界戳.界戳违规:
+            conn.execute(
+                "UPDATE 旁路匣 SET 升格状态='不可升格', 备注=? WHERE 编号=?",
+                ("历史旁路界戳回填失败，禁止升格", 行["编号"]),
+            )
+            continue
+        补数 += 1
+    return 补数
+
+
 def 初始化库() -> None:
     conn = 连接()
     try:
@@ -175,6 +267,7 @@ def 初始化库() -> None:
         conn.execute("BEGIN IMMEDIATE")
         try:
             _补齐列(conn)
+            _建索引(conn)
             for k, v in 默认站规.items():
                 conn.execute("INSERT OR IGNORE INTO 站规(键, 值) VALUES (?, ?)", (k, v))
 
@@ -188,6 +281,7 @@ def 初始化库() -> None:
                     ("房A", "2026-11-22T12:00:00Z", 30, 此刻()),
                 )
             _回填历史旁路(conn)
+            _补戳历史旁路(conn)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
